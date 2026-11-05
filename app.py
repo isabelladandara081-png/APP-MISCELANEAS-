@@ -5,23 +5,22 @@ from datetime import datetime
 
 import pandas as pd
 import streamlit as st
-from openpyxl.styles import Font, PatternFill, Border, Side, Alignment
+from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 
-
 st.set_page_config(
-    page_title="Cruzamento de GN | Lista Quente x Anomalias",
+    page_title="Fluxo GN | Lista Quente 90d x Anomalias STC",
     page_icon="⚡",
     layout="wide",
 )
 
-st.title("⚡ Cruzamento de Lista Quente x Anomalias")
-st.caption(
-    "Carregue as duas bases em Excel (.xlsx). O aplicativo cruza as informações pela GN "
-    "e gera um relatório gerencial com pendências de abertura de miscelânea, reincidência e DEC."
-)
+NONE_OPTION = "(não usar)"
+TIPOS = ["Poda", "Espaçador", "Ramal", "Outros"]
 
 
+# ----------------------------------------------------------------------------
+# Utilitários
+# ----------------------------------------------------------------------------
 def norm_text(value):
     if pd.isna(value):
         return ""
@@ -34,40 +33,26 @@ def norm_header(value):
     return re.sub(r"\s+", " ", value).strip().lower()
 
 
-def find_column(df, candidates, required=True):
-    lookup = {norm_header(col): col for col in df.columns}
-    for candidate in candidates:
-        key = norm_header(candidate)
+def find_column(df, candidates):
+    """Procura a coluna por nome exato e, depois, por nome que contenha o termo."""
+    lookup = {norm_header(c): c for c in df.columns}
+    for cand in candidates:
+        key = norm_header(cand)
         if key in lookup:
             return lookup[key]
-    if required:
-        raise ValueError(
-            "Não encontrei a coluna '" + candidates[0] +
-            "'. Colunas disponíveis: " + ", ".join(map(str, df.columns))
-        )
+    for cand in candidates:
+        key = norm_header(cand)
+        for norm, original in lookup.items():
+            if key in norm:
+                return original
     return None
 
 
 def clean_gn(value):
-    """Padroniza identificadores GN sem alterar a sequência numérica."""
     if pd.isna(value):
         return ""
-    value = str(value).upper().strip()
-    match = re.search(r"GN\s*[-:]?\s*(\d+)", value)
+    match = re.search(r"GN\s*[-:]?\s*(\d+)", str(value).upper())
     return f"GN{match.group(1)}" if match else ""
-
-
-def extract_gn(row, circuit_col, observation_col):
-    # Prioridade: coluna Circuito; se não houver GN, procura na Observação.
-    gn = clean_gn(row.get(circuit_col, ""))
-    if gn:
-        return gn
-    if observation_col:
-        text = norm_text(row.get(observation_col, ""))
-        match = re.search(r"GN\s*[-:]?\s*(\d+)", text.upper())
-        if match:
-            return f"GN{match.group(1)}"
-    return ""
 
 
 def number_value(value):
@@ -80,24 +65,8 @@ def number_value(value):
     return float(match.group()) if match else 0.0
 
 
-def pct_text(value):
-    if pd.isna(value) or str(value).strip() in ("", "—", "-"):
-        return ""
-    text = str(value).strip()
-    if "%" in text:
-        return text
-    try:
-        return f"{float(str(value).replace(',', '.')):.2f}%"
-    except Exception:
-        return text
-
-
-def first_nonempty(series):
-    for value in series:
-        value = norm_text(value)
-        if value and value not in ("—", "-", "nan", "None"):
-            return value
-    return ""
+def to_date(series):
+    return pd.to_datetime(series, dayfirst=True, errors="coerce").dt.normalize()
 
 
 def unique_join(series, separator=", "):
@@ -109,454 +78,513 @@ def unique_join(series, separator=", "):
     return separator.join(values)
 
 
-def read_excel(uploaded_file, expected_columns):
-    try:
-        book = pd.ExcelFile(uploaded_file, engine="openpyxl")
-        for sheet in book.sheet_names:
-            frame = pd.read_excel(book, sheet_name=sheet, dtype=object)
-            normalized = {norm_header(c) for c in frame.columns}
-            if all(norm_header(c) in normalized for c in expected_columns):
-                return frame, sheet
-        # Fallback: primeira aba, para mostrar erro útil abaixo.
-        return pd.read_excel(book, sheet_name=book.sheet_names[0], dtype=object), book.sheet_names[0]
-    except Exception as exc:
-        raise ValueError(f"Não foi possível ler o arquivo Excel: {exc}") from exc
+def fmt_date(value):
+    return "" if pd.isna(value) else value.strftime("%d/%m/%Y")
 
 
-def build_report(anom_raw, hot_raw):
-    # Localiza as colunas principais, tolerando variações de acentuação e espaços.
-    a_circuit = find_column(anom_raw, ["Circuito"])
-    a_group = find_column(anom_raw, ["Conjunto"], required=False)
-    a_group_status = find_column(anom_raw, ["Status Conjunto"], required=False)
-    a_dec = find_column(anom_raw, ["%DEC", "DEC"], required=False)
-    a_type = find_column(anom_raw, ["Tipo"], required=False)
-    a_status = find_column(anom_raw, ["Status"], required=False)
-    a_observation = find_column(anom_raw, ["Observação", "Observacao"], required=False)
-    a_irregularity = find_column(anom_raw, ["Obs. Irregularidade"], required=False)
-    a_admin = find_column(anom_raw, ["Obs. Admin"], required=False)
-    a_miscelanea = find_column(anom_raw, ["Miscelânea", "Miscelanea"], required=False)
+def for_screen(df):
+    """Formata datas como dd/mm/aaaa para exibição na tela."""
+    out = df.copy()
+    for col in out.columns:
+        if pd.api.types.is_datetime64_any_dtype(out[col]):
+            out[col] = out[col].apply(fmt_date)
+    return out
 
-    h_gn = find_column(hot_raw, ["Trafo", "GN", "Transformador"])
-    h_priority = find_column(hot_raw, ["Prioridade"], required=False)
-    h_rec = find_column(hot_raw, ["Reinc. 90 dias", "Reincidência 90 dias"], required=False)
 
+@st.cache_data(show_spinner=False)
+def read_excel_bytes(content, expected_column):
+    book = pd.ExcelFile(io.BytesIO(content), engine="openpyxl")
+    for sheet in book.sheet_names:
+        frame = pd.read_excel(book, sheet_name=sheet, dtype=object)
+        if expected_column in {norm_header(c) for c in frame.columns}:
+            return frame, sheet
+    return pd.read_excel(book, sheet_name=book.sheet_names[0], dtype=object), book.sheet_names[0]
+
+
+def classify_tipo(text):
+    t = norm_header(text)
+    if "poda" in t or "vegeta" in t or "arvore" in t:
+        return "Poda"
+    if "espa" in t:
+        return "Espaçador"
+    if "ramal" in t:
+        return "Ramal"
+    return "Outros"
+
+
+def status_flags(status, exec_date):
+    s = norm_header(status)
+    executed = any(k in s for k in ("executad", "conclu", "finaliz", "realizad")) or pd.notna(exec_date)
+    scheduled = (not executed) and any(k in s for k in ("programad", "agendad"))
+    return executed, scheduled
+
+
+# ----------------------------------------------------------------------------
+# Regra de negócio
+# ----------------------------------------------------------------------------
+def build_flow(anom_raw, hot_raw, cols, today, window_days, stc_col, stc_value):
+    """
+    cols: dicionário com as colunas escolhidas (None quando não usada).
+    Retorna (dicionário de abas, informações de apoio).
+    """
     anom = anom_raw.copy()
-    anom["_GN"] = anom.apply(
-        lambda row: extract_gn(row, a_circuit, a_observation), axis=1
-    )
+    total_registros = len(anom)
+
+    # 1) Somente informações do STC
+    removidos_stc = 0
+    if stc_col and stc_value.strip():
+        alvo = norm_header(stc_value)
+        mask = anom[stc_col].apply(lambda v: alvo in norm_header(v) if pd.notna(v) else False)
+        removidos_stc = int((~mask).sum())
+        anom = anom[mask].copy()
+
+    # 2) GN de cada anomalia (Circuito; se vazio, Observação)
+    def get_gn(row):
+        gn = clean_gn(row.get(cols["a_circuito"]))
+        if not gn and cols["a_obs"]:
+            gn = clean_gn(row.get(cols["a_obs"]))
+        return gn
+
+    anom["_GN"] = anom.apply(get_gn, axis=1)
+    sem_gn = int((anom["_GN"] == "").sum())
     anom = anom[anom["_GN"] != ""].copy()
 
-    # Agrega os registros da base de anomalias por GN.
-    anomaly_rows = []
-    for gn, group in anom.groupby("_GN", sort=False):
-        statuses = group[a_status].astype(str).str.strip().str.lower() if a_status else pd.Series([], dtype=str)
-        pending = int(statuses.isin(["pendente", "pendente de execução", "não iniciado", "nao iniciado"]).sum()) if a_status else 0
-        completed = int(statuses.isin(["concluído", "concluido", "executado", "concluída", "concluida"]).sum()) if a_status else 0
-        scheduled = int(statuses.isin(["programado", "programada", "agendado", "agendada"]).sum()) if a_status else 0
+    # 3) Campos derivados por anomalia
+    blank = pd.Series([pd.NaT] * len(anom), index=anom.index)
+    anom["_d_anom"] = to_date(anom[cols["a_data_anom"]]) if cols["a_data_anom"] else blank
+    anom["_d_oe"] = to_date(anom[cols["a_data_oe"]]) if cols["a_data_oe"] else blank
+    anom["_d_exec"] = to_date(anom[cols["a_data_exec"]]) if cols["a_data_exec"] else blank
+    anom["_oe_num"] = anom[cols["a_oe"]].apply(norm_text) if cols["a_oe"] else ""
+    anom["_tipo"] = anom[cols["a_tipo"]].apply(classify_tipo) if cols["a_tipo"] else "Outros"
 
-        group_names = group[a_group] if a_group else pd.Series([], dtype=object)
-        dec_status = group[a_group_status] if a_group_status else pd.Series([], dtype=object)
-        dec_values = group[a_dec] if a_dec else pd.Series([], dtype=object)
-
-        # Conjunto(s) com DEC acima da meta / status de transgressão.
-        transgression = []
-        for idx in group.index:
-            status = norm_text(group.at[idx, a_group_status]).lower() if a_group_status else ""
-            dec = group.at[idx, a_dec] if a_dec else ""
-            if "transgress" in status or number_value(dec) > 100:
-                name = norm_text(group.at[idx, a_group]) if a_group else ""
-                if name and name not in transgression:
-                    transgression.append(name)
-
-        all_groups = unique_join(group_names, " | ") if a_group else ""
-        status_conjunto = "Transgressão" if transgression else first_nonempty(dec_status)
-        dec_conjunto = ""
-        if a_dec:
-            for val in dec_values:
-                if norm_text(val):
-                    dec_conjunto = pct_text(val)
-                    if number_value(val) > 100:
-                        break
-
-        anomaly_rows.append({
-            "GN_match": gn,
-            "Qtd_Anomalias": len(group),
-            "Anomalias_Pendentes": pending,
-            "Anomalias_Concluidas": completed,
-            "Anomalias_Programadas": scheduled,
-            "Tipos_Anomalia": unique_join(group[a_type]) if a_type else "",
-            "Status_DEC_Conjunto": status_conjunto,
-            "Conjunto": all_groups,
-            "DEC_Conjunto": dec_conjunto,
-            "DEC_Transgressao": "SIM" if transgression else "NÃO",
-            "_Transgressao_Conjuntos": " | ".join(transgression),
-            "Miscelanea_Origem": unique_join(group[a_miscelanea], " | ") if a_miscelanea else "",
-            "Observacoes_Anomalia": unique_join(
-                pd.concat([
-                    group[a_observation] if a_observation else pd.Series([], dtype=object),
-                    group[a_irregularity] if a_irregularity else pd.Series([], dtype=object),
-                    group[a_admin] if a_admin else pd.Series([], dtype=object),
-                ], ignore_index=True),
-                " | "
-            ),
-        })
-    anomaly_summary = pd.DataFrame(anomaly_rows)
-
-    hot = hot_raw.copy()
-    hot["_GN"] = hot[h_gn].apply(clean_gn)
-    # Mantém todos os transformadores da Lista Quente, inclusive identificadores
-    # que não começam por GN (AP, SW, TR etc.). Só os identificadores GN participam
-    # do cruzamento com a base Anomalias.
-    if h_priority:
-        hot["_sort_priority"] = pd.to_numeric(hot[h_priority], errors="coerce")
-        hot = hot.sort_values(["_sort_priority"], na_position="last")
-    else:
-        hot["_sort_priority"] = range(1, len(hot) + 1)
-
-    # Remove apenas duplicidades reais: GN quando identificada; caso contrário,
-    # usa o identificador original da coluna Trafo.
-    hot["_JOIN_KEY"] = hot.apply(
-        lambda row: row["_GN"] if row["_GN"] else "ID:" + norm_text(row[h_gn]).upper(),
+    flags = anom.apply(
+        lambda r: status_flags(r.get(cols["a_status"]) if cols["a_status"] else "", r["_d_exec"]),
         axis=1,
     )
-    hot = hot.drop_duplicates("_JOIN_KEY", keep="first").copy()
-    anomaly_map = anomaly_summary.set_index("GN_match").to_dict("index")
+    anom["_exec"] = [f[0] for f in flags]
+    anom["_prog"] = [f[1] for f in flags]
+    anom["_pend"] = ~(anom["_exec"] | anom["_prog"])
+    anom["_has_oe"] = (anom["_oe_num"] != "") | anom["_d_oe"].notna()
+    anom["_pend_sem_oe"] = (~anom["_exec"]) & (~anom["_has_oe"])
+    anom["_d_exec_ef"] = anom["_d_exec"].where(anom["_exec"])
+    for tipo in TIPOS:
+        anom[f"_t_{tipo}"] = (anom["_tipo"] == tipo).astype(int)
 
-    merged = hot.copy()
-    for col in anomaly_summary.columns:
-        if col != "GN_match":
-            merged[col] = merged["_GN"].map(
-                {gn: row.get(col, "") for gn, row in anomaly_map.items()}
-            )
+    # 4) Consolidação por GN
+    if len(anom):
+        agg = anom.groupby("_GN").agg(
+            Qtd_Anomalias=("_GN", "size"),
+            Pendentes_Execucao=("_pend", "sum"),
+            Programadas=("_prog", "sum"),
+            Executadas=("_exec", "sum"),
+            Sem_OE=("_pend_sem_oe", "sum"),
+            Poda=("_t_Poda", "sum"),
+            Espacador=("_t_Espaçador", "sum"),
+            Ramal=("_t_Ramal", "sum"),
+            Outros=("_t_Outros", "sum"),
+            Data_Ultima_Anomalia=("_d_anom", "max"),
+            Data_Ultima_OE=("_d_oe", "max"),
+            Data_Ultima_Execucao=("_d_exec_ef", "max"),
+            Qtd_OE=("_oe_num", lambda s: len({v for v in s if v})),
+            OE_Numeros=("_oe_num", lambda s: unique_join(s, " | ")),
+            Tem_OE=("_has_oe", "any"),
+        ).reset_index().rename(columns={"_GN": "GN"})
+        agg["Pendentes_Execucao"] = agg["Pendentes_Execucao"].astype(int)
+        agg["Programadas"] = agg["Programadas"].astype(int)
+        agg["Executadas"] = agg["Executadas"].astype(int)
+        agg["Sem_OE"] = agg["Sem_OE"].astype(int)
+    else:
+        agg = pd.DataFrame(columns=[
+            "GN", "Qtd_Anomalias", "Pendentes_Execucao", "Programadas", "Executadas", "Sem_OE",
+            "Poda", "Espacador", "Ramal", "Outros", "Data_Ultima_Anomalia", "Data_Ultima_OE",
+            "Data_Ultima_Execucao", "Qtd_OE", "OE_Numeros", "Tem_OE",
+        ])
 
-    merged["Consta_na_Anomalias"] = merged["_GN"].map(
-        lambda gn: "SIM" if gn in anomaly_map else "NÃO"
-    )
-    merged["Inspecao_Lista_Quente"] = merged.get(
-        find_column(hot_raw, ["Origem Levantamento"], required=False), pd.Series("", index=merged.index)
-    ).fillna("").astype(str).apply(lambda x: "SIM" if x.strip() and x.strip() not in ("—", "-") else "NÃO")
-    merged["Status_Miscelanea"] = merged["Consta_na_Anomalias"].apply(
-        lambda x: "PENDENTE DE ABERTURA" if x == "SIM" else "—"
-    )
+    # 5) Lista Quente (90 dias)
+    hot = hot_raw.copy()
+    hot["GN"] = hot[cols["h_gn"]].apply(clean_gn)
+    hot = hot[hot["GN"] != ""].copy()
+    hot_out = pd.DataFrame({"GN": hot["GN"]})
+    hot_out["Prioridade"] = pd.to_numeric(hot[cols["h_prior"]], errors="coerce") if cols["h_prior"] else pd.NA
+    hot_out["Reinc_90_dias"] = hot[cols["h_reinc"]].apply(number_value) if cols["h_reinc"] else 0.0
+    hot_out["Data_Ultima_Ocorrencia"] = to_date(hot[cols["h_data_ocor"]]) if cols["h_data_ocor"] else pd.NaT
+    hot_out["Conjunto"] = hot[cols["h_conjunto"]].apply(norm_text) if cols["h_conjunto"] else ""
+    hot_out = hot_out.sort_values(["Reinc_90_dias", "Data_Ultima_Ocorrencia"], ascending=[False, False])
+    hot_out = hot_out.drop_duplicates("GN", keep="first")
+    hot_out["Na_Lista_Quente"] = "SIM"
 
-    # DEC fora da meta é um indicador do conjunto, não da GN individual.
-    merged["Prioridade_Analise"] = merged.apply(
-        lambda r: (
-            "ALTA – DEC fora da meta + reincidência"
-            if r.get("DEC_Transgressao") == "SIM"
-            else "ALTA – reincidência + anomalia pendente"
-            if r.get("Consta_na_Anomalias") == "SIM" and number_value(r.get("Anomalias_Pendentes", 0)) > 0
-            else "ALTA – reincidência + anomalia registrada"
-            if r.get("Consta_na_Anomalias") == "SIM"
-            else "Acompanhar conforme ranking"
-        ), axis=1
-    )
+    # 6) União das duas bases
+    full = hot_out.merge(agg, on="GN", how="outer")
+    full["Na_Lista_Quente"] = full["Na_Lista_Quente"].fillna("NÃO")
+    full["Inspecionada_STC"] = full["Qtd_Anomalias"].notna().map({True: "SIM", False: "NÃO"})
+    for c in ["Qtd_Anomalias", "Pendentes_Execucao", "Programadas", "Executadas", "Sem_OE",
+              "Poda", "Espacador", "Ramal", "Outros", "Qtd_OE"]:
+        full[c] = full[c].fillna(0).astype(int)
+    full["Reinc_90_dias"] = full["Reinc_90_dias"].fillna(0)
+    for c in ["Conjunto", "OE_Numeros"]:
+        full[c] = full[c].fillna("")
+    full["Tem_OE"] = full["Tem_OE"].fillna(False).astype(bool)
 
-    # Nomes originais da Lista Quente, para preservar os campos de origem.
-    hot_cols = [c for c in hot_raw.columns]
-    full = merged.copy()
-    full["GN / Transformador"] = full["_GN"]
+    # 7) Status da miscelânea
+    def status_misc(r):
+        if r["Inspecionada_STC"] == "NÃO":
+            return "—"
+        if r["Sem_OE"] > 0:
+            return "PENDENTE DE ABERTURA"
+        if r["Pendentes_Execucao"] + r["Programadas"] > 0:
+            return "OE GERADA – EM EXECUÇÃO"
+        return "TODAS EXECUTADAS"
 
-    # Cruzamento completo (colunas de origem + indicadores).
-    complete_cols = hot_cols + [
-        "Qtd_Anomalias", "Anomalias_Pendentes", "Anomalias_Concluidas",
-        "Anomalias_Programadas", "Tipos_Anomalia", "Status_DEC_Conjunto",
-        "Conjunto", "DEC_Conjunto", "Consta_na_Anomalias",
-        "Inspecao_Lista_Quente", "DEC_Transgressao", "Prioridade_Analise",
-        "Status_Miscelanea",
+    full["Status_Miscelanea"] = full.apply(status_misc, axis=1)
+
+    # 8) Janela de 90 dias (última execução x nova OE)
+    today = pd.Timestamp(today).normalize()
+    exec_d = full["Data_Ultima_Execucao"]
+    oe_d = full["Data_Ultima_OE"]
+    full["Fim_Janela_90d"] = exec_d + pd.Timedelta(days=window_days)
+    full["Dias_Desde_Execucao"] = (today - exec_d).dt.days
+    full["Dias_Restantes_Janela"] = (full["Fim_Janela_90d"] - today).dt.days
+    full["Dias_Execucao_ate_Nova_OE"] = (oe_d - exec_d).dt.days.where(oe_d > exec_d)
+    full["Dias_Desde_Ultima_OE"] = (today - oe_d).dt.days
+    ocor = full["Data_Ultima_Ocorrencia"]
+    full["Ocorrencia_Apos_Execucao"] = (ocor > exec_d).map({True: "SIM", False: "NÃO"})
+    full["Dias_Execucao_ate_Ocorrencia"] = (ocor - exec_d).dt.days.where(ocor > exec_d)
+
+    def situacao(r):
+        if r["Inspecionada_STC"] == "NÃO":
+            return "SEM INSPEÇÃO STC"
+        if pd.isna(r["Data_Ultima_Execucao"]):
+            if r["Executadas"] > 0:
+                return "EXECUTADA SEM DATA (informar)"
+            return "AGUARDANDO EXECUÇÃO"
+        nova_oe = r["Dias_Execucao_ate_Nova_OE"]
+        if pd.notna(nova_oe) and nova_oe <= window_days:
+            return f"REINCIDENTE – nova OE em até {window_days} dias"
+        if today <= r["Fim_Janela_90d"]:
+            return f"EM JANELA {window_days}d – NÃO GERAR NOVA OE"
+        return "JANELA ENCERRADA"
+
+    full["Situacao_90d"] = full.apply(situacao, axis=1)
+
+    def acao(r):
+        s = r["Situacao_90d"]
+        if s == "SEM INSPEÇÃO STC":
+            return "Delegar fiscal (Lista Quente)"
+        if r["Status_Miscelanea"] == "PENDENTE DE ABERTURA":
+            if s.startswith("EM JANELA") or s.startswith("REINCIDENTE"):
+                return "Avaliar antes de abrir OE (dentro dos 90 dias da execução)"
+            return "Gerar miscelânea / OE"
+        if r["Status_Miscelanea"] == "OE GERADA – EM EXECUÇÃO":
+            return "Acompanhar execução em campo"
+        if s.startswith("EM JANELA"):
+            return "Monitorar – não gerar nova OE até o fim da janela"
+        if s.startswith("REINCIDENTE"):
+            return "Analisar causa da reincidência"
+        return "Sem ação – acompanhar Lista Quente"
+
+    full["Acao_Recomendada"] = full.apply(acao, axis=1)
+
+    ordered = [
+        "GN", "Prioridade", "Conjunto", "Na_Lista_Quente", "Reinc_90_dias", "Data_Ultima_Ocorrencia",
+        "Inspecionada_STC", "Qtd_Anomalias", "Poda", "Espacador", "Ramal", "Outros",
+        "Pendentes_Execucao", "Programadas", "Executadas",
+        "Status_Miscelanea", "Qtd_OE", "OE_Numeros", "Data_Ultima_Anomalia", "Data_Ultima_OE",
+        "Data_Ultima_Execucao", "Fim_Janela_90d", "Dias_Desde_Execucao", "Dias_Restantes_Janela",
+        "Dias_Execucao_ate_Nova_OE", "Dias_Desde_Ultima_OE", "Ocorrencia_Apos_Execucao",
+        "Dias_Execucao_ate_Ocorrencia", "Situacao_90d", "Acao_Recomendada",
     ]
-    complete = pd.DataFrame(index=full.index)
-    for c in hot_cols:
-        complete[c] = full[c]
-    for c in complete_cols[len(hot_cols):]:
-        complete[c] = full[c]
+    full = full[ordered].sort_values(
+        ["Reinc_90_dias", "Pendentes_Execucao"], ascending=[False, False]
+    ).reset_index(drop=True)
 
-    # Pendências de miscelânea: toda GN presente na base Anomalias é considerada
-    # inspecionada e pendente de abertura, independentemente do Status do registro.
-    hot_index = full[full["_GN"] != ""].drop_duplicates("_GN").set_index("_GN", drop=False)
-    pending_rows = []
-    for _, ar in anomaly_summary.iterrows():
-        gn = ar["GN_match"]
-        is_hot = gn in hot_index.index
-        hr = hot_index.loc[gn] if is_hot else None
-        if isinstance(hr, pd.DataFrame):
-            hr = hr.iloc[0]
+    # 9) Abas
+    pend_abertura = full[full["Status_Miscelanea"] == "PENDENTE DE ABERTURA"]
+    em_execucao = full[full["Status_Miscelanea"] == "OE GERADA – EM EXECUÇÃO"]
+    executadas = full[(full["Executadas"] > 0)].sort_values("Data_Ultima_Execucao", ascending=False)
+    em_janela = full[full["Situacao_90d"].str.startswith("EM JANELA")].sort_values("Dias_Restantes_Janela")
+    reincidentes = full[
+        full["Situacao_90d"].str.startswith("REINCIDENTE") | (full["Ocorrencia_Apos_Execucao"] == "SIM")
+    ]
+    sem_inspecao = full[full["Situacao_90d"] == "SEM INSPEÇÃO STC"]
 
-        def hot_value(candidates):
-            if not is_hot:
-                return ""
-            col = find_column(hot_raw, candidates, required=False)
-            return hr[col] if col else ""
+    detalhe_cols = [c for c in anom.columns if not c.startswith("_")]
+    detalhe = anom[["_GN"] + detalhe_cols].rename(columns={"_GN": "GN"}).copy()
+    detalhe.insert(1, "Tipo (classificado)", anom["_tipo"])
+    detalhe.insert(2, "Situação do registro", anom.apply(
+        lambda r: "EXECUTADA" if r["_exec"] else ("PROGRAMADA" if r["_prog"] else "PENDENTE"), axis=1))
+    detalhe.insert(3, "OE gerada", anom["_has_oe"].map({True: "SIM", False: "NÃO"}))
 
-        pval = hot_value(["Prioridade"])
-        pending_rows.append({
-            "Prioridade Lista Quente": pval,
-            "GN / Transformador": gn,
-            "Status Miscelânea": "PENDENTE DE ABERTURA",
-            "Inspeção": "SIM",
-            "Na Lista Quente?": "SIM" if is_hot else "NÃO",
-            "Reinc. 90 dias": hot_value(["Reinc. 90 dias", "Reincidência 90 dias"]),
-            "Total Histórico": hot_value(["Total Histórico"]),
-            "Clientes": hot_value(["Clientes"]),
-            "Última Ocorrência": hot_value(["Última Ocorrência"]),
-            "Causa Recente": hot_value(["Causa Recente"]),
-            "Conjunto": ar["Conjunto"],
-            "Status DEC Conjunto": ar["Status_DEC_Conjunto"],
-            "% DEC Conjunto": ar["DEC_Conjunto"],
-            "Qtd. Registros Anomalia": ar["Qtd_Anomalias"],
-            "Tipos de Anomalia": ar["Tipos_Anomalia"],
-            "Status dos Registros de Anomalia": (
-                f"Concluído: {ar['Anomalias_Concluidas']}; Pendente: {ar['Anomalias_Pendentes']}; "
-                f"Programado: {ar['Anomalias_Programadas']}"
-            ).strip("; "),
-            "Miscelânea (campo origem)": ar["Miscelanea_Origem"],
-            "Observações de Anomalia": ar["Observacoes_Anomalia"],
-        })
-    pending = pd.DataFrame(pending_rows)
-    pending["_priority_sort"] = pd.to_numeric(pending["Prioridade Lista Quente"], errors="coerce")
-    pending["_hot_sort"] = pending["Na Lista Quente?"].map({"SIM": 0, "NÃO": 1})
-    pending = pending.sort_values(
-        ["_hot_sort", "_priority_sort", "GN / Transformador"],
-        na_position="last"
-    ).drop(columns=["_priority_sort", "_hot_sort"]).reset_index(drop=True)
+    por_tipo = full[full["Inspecionada_STC"] == "SIM"][
+        ["GN", "Qtd_Anomalias", "Poda", "Espacador", "Ramal", "Outros",
+         "Pendentes_Execucao", "Programadas", "Executadas"]
+    ]
 
-    # Abas analíticas.
-    top15 = complete.head(15).copy()
-    top15["Consta_na_Anomalias"] = top15["Consta_na_Anomalias"]
-    dec_priority = complete[complete["DEC_Transgressao"] == "SIM"].copy()
-    both = complete[complete["Consta_na_Anomalias"] == "SIM"].copy()
-    only_anomaly = anomaly_summary[
-        ~anomaly_summary["GN_match"].isin(set(hot["_GN"]))
-    ].copy()
-
-    # Tabela por GN (para inspeção detalhada).
-    anomaly_by_gn = anomaly_summary.drop(columns=["DEC_Transgressao", "_Transgressao_Conjuntos", "Miscelanea_Origem", "Observacoes_Anomalia"], errors="ignore")
-    dec_groups = []
-    if a_group:
-        tmp = anom.copy()
-        tmp["_DEC_NUM"] = tmp[a_dec].apply(number_value) if a_dec else 0
-        for group_name, g in tmp.groupby(a_group, dropna=False):
-            if not norm_text(group_name):
-                continue
-            status = first_nonempty(g[a_group_status]) if a_group_status else ""
-            dec = first_nonempty(g[a_dec]) if a_dec else ""
-            if ("transgress" in status.lower()) or (a_dec and g["_DEC_NUM"].max() > 100):
-                gn_set = sorted(set(g["_GN"].dropna()) - {""})
-                hot_set = sorted(set(gn_set) & set(hot["_GN"]))
-                dec_groups.append({
-                    "Conjunto": group_name,
-                    "%DEC": pct_text(dec),
-                    "Registros_Anomalia": len(g),
-                    "GNs_identificadas": len(gn_set),
-                    "GNs_na_Lista_Quente": len(hot_set),
-                })
-    dec_transgression = pd.DataFrame(
-        dec_groups,
-        columns=["Conjunto", "%DEC", "Registros_Anomalia", "GNs_identificadas", "GNs_na_Lista_Quente"]
-    )
-
-    total_hot = len(hot)
-    total_anom_gn = len(anomaly_summary)
-    total_both = len(both)
-    total_anom_records = len(anom)
-    # Indicadores de volume consideram todas as linhas da base original,
-    # inclusive registros sem GN identificável; o cruzamento por GN considera
-    # apenas as linhas em que foi possível extrair a chave.
-    status_counts = anom_raw[a_status].astype(str).str.strip().str.lower().value_counts() if a_status else {}
-    summary = pd.DataFrame([
-        ["Transformadores na Lista Quente", total_hot],
-        ["GN distintas identificadas na Anomalias", total_anom_gn],
-        ["GN presentes nas duas listas", total_both],
-        ["GN da Lista Quente sem correspondência na Anomalias", total_hot - total_both],
-        ["GN da Lista Quente com anomalia pendente", int((both["Anomalias_Pendentes"].fillna(0).astype(float) > 0).sum()) if len(both) else 0],
-        ["GN coincidentes com DEC em Transgressão", int((both["DEC_Transgressao"] == "SIM").sum()) if len(both) else 0],
-        ["Registros de anomalia (linhas)", len(anom_raw)],
-        ["Registros de anomalia pendentes", int(status_counts.get("pendente", 0))],
-        ["Registros de anomalia concluídos", int(status_counts.get("concluído", 0) + status_counts.get("concluido", 0))],
-        ["Registros de anomalia programados", int(status_counts.get("programado", 0) + status_counts.get("programada", 0))],
-        ["GN pendentes de abertura de miscelânea (Lista Anomalias)", total_anom_gn],
-        ["GN da Lista Anomalias também na Lista Quente", total_both],
+    resumo = pd.DataFrame([
+        ("Data de referência", today.strftime("%d/%m/%Y")),
+        ("Janela de reincidência (dias)", window_days),
+        ("Registros na base Anomalias", total_registros),
+        ("Registros removidos pelo filtro STC", removidos_stc),
+        ("Registros STC sem GN identificada", sem_gn),
+        ("Registros STC considerados", len(anom)),
+        ("GN na Lista Quente", int((full["Na_Lista_Quente"] == "SIM").sum())),
+        ("GN inspecionadas pelo STC", int((full["Inspecionada_STC"] == "SIM").sum())),
+        ("GN da Lista Quente sem inspeção STC", len(sem_inspecao)),
+        ("GN pendentes de abertura de miscelânea", len(pend_abertura)),
+        ("GN com OE gerada em execução", len(em_execucao)),
+        ("GN com anomalia executada", len(executadas)),
+        ("GN em janela de 90 dias (não gerar OE)", len(em_janela)),
+        ("GN reincidentes", len(reincidentes)),
     ], columns=["Indicador", "Resultado"])
 
-    criteria = pd.DataFrame({"Observação": [
-        f"Cruzamento gerado em {datetime.now().strftime('%d/%m/%Y %H:%M')}, utilizando a GN como chave.",
-        "Na planilha Anomalias, a GN é identificada prioritariamente pela coluna Circuito; quando não encontrada, é extraída da coluna Observação.",
-        "Todas as GN presentes na base Anomalias são consideradas já inspecionadas e PENDENTES DE ABERTURA DE MISCELÂNEA, conforme regra de gestão informada.",
-        "O campo Status da base Anomalias descreve o status do registro/anomalia e NÃO altera o status da abertura de miscelânea.",
-        "O DEC e o Status Conjunto são indicadores do conjunto, não do transformador individual. GN associada a conjunto em transgressão não significa DEC individual fora da meta.",
-        "A quantidade de anomalias representa linhas/registros da base, não necessariamente defeitos distintos.",
-        "A indicação de prioridade é uma triagem gerencial baseada nos dados disponíveis e não substitui validação técnica/operacional.",
+    criterios = pd.DataFrame({"Critério": [
+        "Somente registros do STC entram no fluxo (filtro pela coluna escolhida na barra lateral).",
+        "A GN da anomalia vem da coluna Circuito; se não houver GN, procura na coluna Observação.",
+        "Tipo da anomalia: Poda, Espaçador, Ramal ou Outros (classificado pelo texto da coluna Tipo).",
+        "Anomalia EXECUTADA: status contém executado/concluído/finalizado/realizado ou existe data de execução.",
+        "Anomalia PROGRAMADA: status contém programado/agendado. As demais são PENDENTES de execução.",
+        "Status da miscelânea: PENDENTE DE ABERTURA quando há anomalia não executada sem OE/data de OE.",
+        f"Janela de {window_days} dias: conta a partir da data da última anomalia executada da GN.",
+        f"REINCIDENTE: nova OE gerada até {window_days} dias depois da última execução.",
+        f"EM JANELA: ainda dentro dos {window_days} dias da execução e sem nova OE – não gerar nova OE.",
+        "JANELA ENCERRADA: passaram os dias da janela; nova OE deixa de contar como reincidência.",
+        "Ocorrência após execução: data da última ocorrência (Lista Quente) posterior à última execução.",
+        "Reinc. 90 dias e data da última ocorrência vêm da Lista Quente e servem para priorizar fiscais.",
     ]})
 
-    # Ordena por ranking da Lista Quente (quando existe) e, depois, por reincidência.
-    if "Prioridade" in complete.columns:
-        complete["_p"] = pd.to_numeric(complete["Prioridade"], errors="coerce")
-        complete = complete.sort_values("_p", na_position="last").drop(columns="_p")
-        top15 = complete.head(15).copy()
-        both = complete[complete["Consta_na_Anomalias"] == "SIM"].copy()
-        dec_priority = complete[complete["DEC_Transgressao"] == "SIM"].copy()
-
-    return {
-        "Pend. Miscelânea": pending,
-        "Resumo": summary,
-        "Top 15": top15,
-        "Prioridade DEC": dec_priority,
-        "Cruzamento completo": complete,
-        "GN nas duas listas": both,
-        "Anomalias por GN": anomaly_by_gn,
-        "Só Anomalias": only_anomaly,
-        "DEC Transgressão": dec_transgression,
-        "Critérios e ressalvas": criteria,
+    sheets = {
+        "Resumo": resumo,
+        "Acompanhamento GN": full,
+        "Gerar Miscelânea": pend_abertura,
+        "OE em Execução": em_execucao,
+        "Executadas": executadas,
+        "Em Janela 90d": em_janela,
+        "Reincidentes": reincidentes,
+        "Sem Inspeção STC": sem_inspecao,
+        "Anomalias por Tipo": por_tipo,
+        "Detalhe Anomalias STC": detalhe,
+        "Critérios": criterios,
     }
+    return sheets
+
+
+# ----------------------------------------------------------------------------
+# Excel
+# ----------------------------------------------------------------------------
+SITUACAO_CORES = {
+    "REINCIDENTE": ("F4CCCC", "990000"),
+    "EM JANELA": ("FFF2CC", "7F6000"),
+    "AGUARDANDO": ("FCE4D6", "C00000"),
+    "EXECUTADA SEM": ("FCE4D6", "C00000"),
+    "JANELA ENCERRADA": ("D9EAD3", "274E13"),
+    "SEM INSPEÇÃO": ("EDEDED", "595959"),
+}
 
 
 def format_workbook(sheets):
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        for sheet_name, frame in sheets.items():
-            frame.to_excel(writer, sheet_name=sheet_name[:31], index=False)
+        for name, frame in sheets.items():
+            frame.to_excel(writer, sheet_name=name[:31], index=False)
 
-        wb = writer.book
         header_fill = PatternFill("solid", fgColor="17365D")
         header_font = Font(color="FFFFFF", bold=True)
-        thin_gray = Side(style="thin", color="D9E2F3")
+        border = Border(bottom=Side(style="thin", color="D9E2F3"))
 
-        for ws in wb.worksheets:
-            ws.freeze_panes = "A2"
+        for ws in writer.book.worksheets:
+            ws.freeze_panes = "B2"
             ws.auto_filter.ref = ws.dimensions
             ws.sheet_view.showGridLines = False
-            ws.row_dimensions[1].height = 32
+            ws.row_dimensions[1].height = 34
             for cell in ws[1]:
                 cell.fill = header_fill
                 cell.font = header_font
+                cell.border = border
                 cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
-                cell.border = Border(bottom=thin_gray)
 
-            for col_idx, cells in enumerate(ws.columns, start=1):
-                values = [len(str(c.value)) if c.value is not None else 0 for c in list(cells)[:250]]
-                width = min(max(max(values, default=10) + 2, 12), 42)
-                ws.column_dimensions[get_column_letter(col_idx)].width = width
+            for idx, cells in enumerate(ws.columns, start=1):
+                lens = [len(str(c.value)) if c.value is not None else 0 for c in list(cells)[:250]]
+                ws.column_dimensions[get_column_letter(idx)].width = min(max(max(lens, default=10) + 2, 12), 46)
 
-            # Realça pendências de abertura de miscelânea.
-            headers = {cell.value: cell.column for cell in ws[1]}
-            status_col = headers.get("Status Miscelânea")
-            if status_col:
-                for row in range(2, ws.max_row + 1):
-                    cell = ws.cell(row, status_col)
-                    cell.fill = PatternFill("solid", fgColor="FCE4D6")
-                    cell.font = Font(color="C00000", bold=True)
-
-            # Destaque de DEC em transgressão.
-            for header in ("Status DEC Conjunto", "Status_DEC_Conjunto"):
-                col = headers.get(header)
-                if col:
+            headers = {c.value: c.column for c in ws[1]}
+            for header, col in headers.items():
+                if header and ("Data" in str(header) or "Fim_Janela" in str(header)):
                     for row in range(2, ws.max_row + 1):
-                        cell = ws.cell(row, col)
-                        if "transgress" in str(cell.value).lower():
-                            cell.fill = PatternFill("solid", fgColor="F4CCCC")
-                            cell.font = Font(color="990000", bold=True)
+                        ws.cell(row, col).number_format = "DD/MM/YYYY"
 
+            sit_col = headers.get("Situacao_90d")
+            if sit_col:
+                for row in range(2, ws.max_row + 1):
+                    cell = ws.cell(row, sit_col)
+                    for key, (bg, fg) in SITUACAO_CORES.items():
+                        if str(cell.value).startswith(key):
+                            cell.fill = PatternFill("solid", fgColor=bg)
+                            cell.font = Font(color=fg, bold=True)
+                            break
+
+            misc_col = headers.get("Status_Miscelanea")
+            if misc_col:
+                for row in range(2, ws.max_row + 1):
+                    cell = ws.cell(row, misc_col)
+                    if cell.value == "PENDENTE DE ABERTURA":
+                        cell.fill = PatternFill("solid", fgColor="FCE4D6")
+                        cell.font = Font(color="C00000", bold=True)
     output.seek(0)
     return output
 
 
+# ----------------------------------------------------------------------------
+# Interface
+# ----------------------------------------------------------------------------
+st.title("⚡ Fluxo de GN – Lista Quente 90 dias x Anomalias STC")
+st.caption(
+    "Cruza a Lista Quente (top reincidentes) com as anomalias levantadas pelo fiscal do STC, "
+    "acompanha miscelânea/OE, execução e a janela de 90 dias que define a reincidência."
+)
+
 with st.sidebar:
+    st.header("Parâmetros")
+    today_input = st.date_input("Data de referência", value=datetime.now().date(), format="DD/MM/YYYY")
+    window_days = st.number_input("Janela de reincidência (dias)", min_value=1, max_value=365, value=90)
+    st.divider()
     st.header("Como usar")
     st.markdown(
-        "1. Anexe a base **Anomalias**.  \n"
-        "2. Anexe a **Lista Quente**.  \n"
-        "3. Clique em **Gerar cruzamento**.  \n"
-        "4. Baixe o Excel consolidado."
-    )
-    st.info(
-        "Regra aplicada: toda GN encontrada na base Anomalias é tratada como "
-        "inspecionada e pendente de abertura de miscelânea."
+        "1. Anexe a **Lista Quente (90 dias)**.  \n"
+        "2. Anexe a base **Anomalias**.  \n"
+        "3. Confira o **mapeamento de colunas**.  \n"
+        "4. Clique em **Gerar fluxo** e baixe o Excel."
     )
 
-col1, col2 = st.columns(2)
-with col1:
-    anom_file = st.file_uploader(
-        "1. Base de Anomalias (.xlsx)",
-        type=["xlsx"],
-        key="anom_file",
-        help="Planilha com os transformadores já inspecionados e pendentes de abertura de miscelânea.",
-    )
-with col2:
-    hot_file = st.file_uploader(
-        "2. Lista Quente (.xlsx)",
-        type=["xlsx"],
-        key="hot_file",
-        help="Ranking de reincidência dos transformadores.",
-    )
+c1, c2 = st.columns(2)
+with c1:
+    hot_file = st.file_uploader("1. Lista Quente – 90 dias (.xlsx)", type=["xlsx"], key="hot")
+with c2:
+    anom_file = st.file_uploader("2. Base de Anomalias (.xlsx)", type=["xlsx"], key="anom")
 
-if anom_file and hot_file:
-    st.success("As duas bases foram carregadas. Gere o cruzamento para montar o relatório.")
-elif anom_file or hot_file:
-    st.warning("Falta anexar a outra planilha para realizar o cruzamento.")
-
-if st.button("Gerar cruzamento", type="primary", disabled=not (anom_file and hot_file)):
+if hot_file and anom_file:
     try:
-        with st.spinner("Lendo as bases e cruzando as GN..."):
-            anom_df, anom_sheet = read_excel(anom_file, ["Circuito"])
-            hot_df, hot_sheet = read_excel(hot_file, ["Trafo"])
-            report = build_report(anom_df, hot_df)
-            excel_file = format_workbook(report)
-            st.session_state["report_bytes"] = excel_file.getvalue()
-            st.session_state["report_sheets"] = report
-            st.session_state["report_name"] = (
-                f"Cruzamento_Lista_Quente_Anomalias_DEC_{datetime.now().strftime('%d-%m-%Y')}.xlsx"
-            )
-            st.session_state["source_sheets"] = (anom_sheet, hot_sheet)
-        st.success("Cruzamento concluído!")
+        hot_raw, hot_sheet = read_excel_bytes(hot_file.getvalue(), "trafo")
+        anom_raw, anom_sheet = read_excel_bytes(anom_file.getvalue(), "circuito")
     except Exception as exc:
-        st.error(f"Não foi possível gerar o cruzamento: {exc}")
-        st.exception(exc)
+        st.error(f"Não foi possível ler as planilhas: {exc}")
+        st.stop()
 
-if "report_bytes" in st.session_state:
-    report = st.session_state["report_sheets"]
-    summary = report["Resumo"].set_index("Indicador")["Resultado"].to_dict()
+    def pick(label, df, candidates, key, required=False):
+        options = list(df.columns) if required else [NONE_OPTION] + list(df.columns)
+        found = find_column(df, candidates)
+        index = options.index(found) if found in options else 0
+        choice = st.selectbox(label, options, index=index, key=key)
+        return None if choice == NONE_OPTION else choice
+
+    with st.expander("⚙️ Mapeamento de colunas (confira antes de gerar)", expanded=False):
+        st.caption("O app tenta reconhecer as colunas sozinho. Ajuste aqui se alguma estiver errada.")
+        ca, cb = st.columns(2)
+        with ca:
+            st.markdown(f"**Lista Quente** (aba: {hot_sheet})")
+            cols = {
+                "h_gn": pick("GN / Trafo", hot_raw, ["Trafo", "GN", "Transformador"], "h_gn", required=True),
+                "h_prior": pick("Prioridade (ranking)", hot_raw, ["Prioridade", "Ranking"], "h_prior"),
+                "h_reinc": pick("Reincidência 90 dias", hot_raw,
+                                ["Reinc. 90 dias", "Reincidência 90 dias", "Reinc 90", "Reincid"], "h_reinc"),
+                "h_data_ocor": pick("Data da última ocorrência", hot_raw,
+                                    ["Última ocorrência", "Ultima ocorrencia", "Data última ocorrência", "Data ocorrência"],
+                                    "h_data_ocor"),
+                "h_conjunto": pick("Conjunto", hot_raw, ["Conjunto"], "h_conjunto"),
+            }
+        with cb:
+            st.markdown(f"**Anomalias** (aba: {anom_sheet})")
+            cols.update({
+                "a_circuito": pick("Circuito (GN)", anom_raw, ["Circuito"], "a_circuito", required=True),
+                "a_obs": pick("Observação (GN alternativa)", anom_raw, ["Observação", "Observacao"], "a_obs"),
+                "a_tipo": pick("Tipo da anomalia", anom_raw, ["Tipo"], "a_tipo"),
+                "a_status": pick("Status", anom_raw, ["Status"], "a_status"),
+                "a_data_anom": pick("Data da anomalia / inspeção", anom_raw,
+                                    ["Data anomalia", "Data inspeção", "Data inspecao", "Data registro", "Data"],
+                                    "a_data_anom"),
+                "a_oe": pick("Nº da OE / Miscelânea", anom_raw, ["OE", "Miscelânea", "Miscelanea"], "a_oe"),
+                "a_data_oe": pick("Data da OE gerada", anom_raw,
+                                  ["Data OE", "Data Miscelânea", "Data Miscelanea", "Data abertura", "Data geração"],
+                                  "a_data_oe"),
+                "a_data_exec": pick("Data da execução", anom_raw,
+                                    ["Data execução", "Data execucao", "Data conclusão", "Data conclusao", "Executado em"],
+                                    "a_data_exec"),
+            })
+        st.markdown("**Filtro STC**")
+        fa, fb = st.columns(2)
+        with fa:
+            stc_col = pick("Coluna que identifica o STC", anom_raw,
+                           ["Equipe", "Empresa", "Origem", "Contratada", "Executor", "Fonte", "Área", "Area", "STC"],
+                           "stc_col")
+        with fb:
+            stc_value = st.text_input("Valor a manter (contém)", value="STC", key="stc_value")
+
+    if not cols["a_data_exec"]:
+        st.warning("Sem coluna de **data da execução** a janela de 90 dias não pode ser calculada.")
+    if not cols["a_data_oe"] and not cols["a_oe"]:
+        st.warning("Sem coluna de **OE/data da OE**, todas as GN não executadas ficam como PENDENTE DE ABERTURA.")
+    if not stc_col:
+        st.warning("Nenhuma coluna de STC escolhida: **todas** as linhas da base Anomalias serão usadas.")
+
+    if st.button("Gerar fluxo", type="primary"):
+        try:
+            with st.spinner("Cruzando as bases e calculando a janela de 90 dias..."):
+                sheets = build_flow(anom_raw, hot_raw, cols, today_input, int(window_days), stc_col, stc_value)
+                st.session_state["flow_sheets"] = sheets
+                st.session_state["flow_bytes"] = format_workbook(sheets).getvalue()
+                st.session_state["flow_name"] = f"Fluxo_GN_Reincidencia_{datetime.now().strftime('%d-%m-%Y')}.xlsx"
+            st.success("Fluxo gerado!")
+        except Exception as exc:
+            st.error(f"Não foi possível gerar o fluxo: {exc}")
+            st.exception(exc)
+elif hot_file or anom_file:
+    st.warning("Falta anexar a outra planilha.")
+
+if "flow_sheets" in st.session_state:
+    sheets = st.session_state["flow_sheets"]
+    res = sheets["Resumo"].set_index("Indicador")["Resultado"].to_dict()
     st.divider()
-    st.subheader("Resultado do cruzamento")
+    st.subheader("Resultado")
 
-    metric_cols = st.columns(4)
-    metrics = [
-        ("GN na Lista Quente", summary.get("Transformadores na Lista Quente", 0)),
-        ("GN na base Anomalias", summary.get("GN distintas identificadas na Anomalias", 0)),
-        ("GN nas duas bases", summary.get("GN presentes nas duas listas", 0)),
-        ("Pendentes de miscelânea", summary.get("GN pendentes de abertura de miscelânea (Lista Anomalias)", 0)),
+    m = st.columns(5)
+    cards = [
+        ("Inspecionadas STC", res["GN inspecionadas pelo STC"]),
+        ("Gerar miscelânea", res["GN pendentes de abertura de miscelânea"]),
+        ("OE em execução", res["GN com OE gerada em execução"]),
+        ("Em janela 90d", res["GN em janela de 90 dias (não gerar OE)"]),
+        ("Reincidentes", res["GN reincidentes"]),
     ]
-    for col, (label, value) in zip(metric_cols, metrics):
+    for col, (label, value) in zip(m, cards):
         with col:
             with st.container(border=True):
                 st.metric(label, f"{int(value):,}".replace(",", "."))
 
     st.download_button(
-        label="⬇️ Baixar relatório Excel completo",
-        data=st.session_state["report_bytes"],
-        file_name=st.session_state["report_name"],
+        "⬇️ Baixar Excel completo (todas as abas)",
+        data=st.session_state["flow_bytes"],
+        file_name=st.session_state["flow_name"],
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         type="primary",
         use_container_width=True,
     )
 
-    tab_pend, tab_top, tab_dec, tab_all = st.tabs(
-        ["📋 Pendentes de miscelânea", "🔥 Top 15", "⚠️ Prioridade DEC", "🗂️ Todas as abas"]
-    )
-    with tab_pend:
-        st.caption(
-            "Todas as GN da base Anomalias aparecem aqui como INSPECIONADAS e "
-            "PENDENTES DE ABERTURA, independentemente do status individual dos registros."
-        )
-        st.dataframe(report["Pend. Miscelânea"].head(50), use_container_width=True, hide_index=True)
-    with tab_top:
-        st.dataframe(report["Top 15"], use_container_width=True, hide_index=True)
-    with tab_dec:
-        st.caption("GN associadas a conjuntos em transgressão de DEC (indicador do conjunto, não do transformador).")
-        st.dataframe(report["Prioridade DEC"].head(50), use_container_width=True, hide_index=True)
-    with tab_all:
-        st.write("Abas incluídas no Excel: " + ", ".join(report.keys()))
-        aba = st.selectbox("Visualizar aba", list(report.keys()))
-        st.dataframe(report[aba].head(100), use_container_width=True, hide_index=True)
+    tabs = st.tabs([
+        "📋 Gerar miscelânea", "🛠️ OE em execução", "✅ Executadas",
+        "⏳ Em janela 90d", "🔁 Reincidentes", "👷 Sem inspeção STC", "🗂️ Todas as abas",
+    ])
+    views = [
+        ("Gerar Miscelânea", "GN inspecionadas pelo STC com anomalia ainda sem OE."),
+        ("OE em Execução", "OE gerada; aguardando execução em campo."),
+        ("Executadas", "GN com anomalia executada e data da última execução."),
+        ("Em Janela 90d", "Executadas há menos de 90 dias: não podem gerar nova OE."),
+        ("Reincidentes", "Nova OE (ou nova ocorrência) dentro da janela após a execução."),
+        ("Sem Inspeção STC", "GN da Lista Quente ainda sem anomalia do STC – candidatas a delegar fiscal."),
+    ]
+    for tab, (name, caption) in zip(tabs[:6], views):
+        with tab:
+            st.caption(f"{caption}  Total: **{len(sheets[name])}**")
+            st.dataframe(for_screen(sheets[name]), use_container_width=True, hide_index=True)
+    with tabs[6]:
+        aba = st.selectbox("Visualizar aba", list(sheets.keys()))
+        st.dataframe(for_screen(sheets[aba]).head(500), use_container_width=True, hide_index=True)
 
 st.divider()
-st.caption("Aplicativo de apoio à gestão operacional. Confira as bases e valide os critérios técnicos antes de direcionar serviços.")
+st.caption("Aplicativo de apoio à gestão operacional. Confira as bases e valide os critérios antes de direcionar serviços.")
